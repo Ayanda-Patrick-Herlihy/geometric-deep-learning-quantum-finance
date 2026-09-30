@@ -455,6 +455,7 @@ def evaluate_model_on_dataset(
     return_debug: bool = False,
     debug_pnl: bool = False,
     dump_pnl_path: str | Path | None = None,
+    dump_predictions_path: str | Path | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], dict[str, Any]]:
     """Evaluates a model across all dates in a dataset.
 
@@ -472,6 +473,9 @@ def evaluate_model_on_dataset(
             and daily_pnl for offline debugging.
         debug_pnl: If True, log summary statistics of daily_pnl.
         dump_pnl_path: If provided, save daily_pnl array to this path (npy format).
+        dump_predictions_path: If provided, save one row per (date, supervised
+            stock) with prediction, targets, price and volume to this parquet
+            file so every metric can be recomputed offline (see posthoc_eval.py).
 
     Returns:
         Dictionary of named evaluation metrics. If return_debug is True,
@@ -499,6 +503,7 @@ def evaluate_model_on_dataset(
     datewise_preds: list[torch.Tensor] = []
     datewise_targets: list[torch.Tensor] = []
     daily_pnl: list[float] = []
+    dump_frames: list[dict[str, np.ndarray]] = []
 
     for idx in range(len(dataset)):
         data = dataset[idx]
@@ -544,6 +549,23 @@ def evaluate_model_on_dataset(
         masked_targets = targets[target_mask]
         masked_close = close_prices[target_mask] if close_prices is not None else None
         masked_volume = volumes[target_mask] if volumes is not None else None
+
+        if dump_predictions_path is not None:
+            n_masked = int(target_mask.sum().item())
+            ticker_id = getattr(data, "ticker_id", None)
+            y_skip1 = getattr(data, "y_skip1", None)
+            nan_col = np.full(n_masked, np.nan, dtype=np.float32)
+            dump_frames.append(
+                {
+                    "date": np.full(n_masked, np.datetime64(dataset.valid_dates[idx]), dtype="datetime64[ns]"),
+                    "ticker_id": ticker_id[target_mask].cpu().numpy() if ticker_id is not None else np.full(n_masked, -1),
+                    "pred": masked_preds.float().cpu().numpy(),
+                    "y": masked_targets.float().cpu().numpy(),
+                    "y_skip1": y_skip1[target_mask].cpu().numpy() if y_skip1 is not None else nan_col,
+                    "close": masked_close.cpu().numpy() if masked_close is not None else nan_col,
+                    "volume": masked_volume.cpu().numpy() if masked_volume is not None else nan_col,
+                }
+            )
 
         # Store for pointwise metrics and date-wise IC.
         all_preds.append(masked_preds.cpu())
@@ -595,6 +617,21 @@ def evaluate_model_on_dataset(
             logger.info("Dumped daily_pnl to %s", output_path)
         except Exception as e:
             logger.error("Failed to dump daily_pnl to %s: %s", dump_pnl_path, e)
+
+    if dump_predictions_path is not None and dump_frames:
+        import pandas as pd
+
+        frame = pd.DataFrame({k: np.concatenate([f[k] for f in dump_frames]) for k in dump_frames[0]})
+        pivot_cols = getattr(dataset, "return_pivot", None)
+        if pivot_cols is not None:
+            tickers = np.asarray(pivot_cols.columns, dtype=object)
+            valid = frame["ticker_id"].to_numpy() >= 0
+            frame["ticker"] = None
+            frame.loc[valid, "ticker"] = tickers[frame.loc[valid, "ticker_id"].to_numpy()]
+        output_path = Path(dump_predictions_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(output_path, index=False)
+        logger.info("Dumped %d prediction rows to %s", len(frame), output_path)
 
     if not all_preds:
         logger.warning("No valid predictions collected during evaluation.")

@@ -290,6 +290,7 @@ def _make_dataloader(
     dataset: FinancialGraphDataset,
     config: dict,
     shuffle: bool = False,
+    generator: torch.Generator | None = None,
 ) -> PyGDataLoader:
     """Wraps a dataset in a PyG DataLoader with prefetching.
 
@@ -297,6 +298,8 @@ def _make_dataloader(
         dataset: The financial graph dataset.
         config: Full configuration dictionary.
         shuffle: Whether to shuffle samples (False for validation).
+        generator: Optional dedicated RNG for the shuffle order, so batch order
+            does not depend on how many global-RNG draws model construction used.
 
     Returns:
         PyG DataLoader with configured batch size and workers.
@@ -314,6 +317,7 @@ def _make_dataloader(
         pin_memory=use_cuda,
         persistent_workers=num_workers > 0,
         drop_last=False,
+        generator=generator,
     )
 
 

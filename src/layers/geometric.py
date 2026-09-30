@@ -193,6 +193,7 @@ class GeometricEmbedding(nn.Module):
         output_dim: Ambient dimension of the hypersphere (n).
             The manifold itself has dimension n - 1.
         eps: Stability constant for normalisation.
+        normalize: If False, skip the projection onto the sphere (control).
     """
 
     def __init__(
@@ -200,11 +201,15 @@ class GeometricEmbedding(nn.Module):
         input_dim: int,
         output_dim: int,
         eps: float = _EPS,
+        normalize: bool = True,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.eps = eps
+        # False gives the Euclidean twin used as a control: identical MLP,
+        # no projection onto the sphere.
+        self.normalize = normalize
 
         # Two-layer MLP projection: hidden layer adds non-linear expressiveness
         # before placing on the sphere
@@ -242,6 +247,8 @@ class GeometricEmbedding(nn.Module):
         # and "Alignment" (preserving relative similarity independent of magnitude).
         # Project features into the ambient space (with non-linear hidden layer)
         projected = self.projection(F.elu(self.pre_projection(x)))
+        if not self.normalize:
+            return projected
         projection_norms = torch.linalg.vector_norm(projected, dim=-1, keepdim=True)
         near_zero_mask = projection_norms < _MIN_PROJECTION_NORM
         if near_zero_mask.any():

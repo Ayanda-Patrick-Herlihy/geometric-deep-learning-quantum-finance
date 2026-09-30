@@ -297,3 +297,64 @@ class QuantumRegimeDetector(nn.Module):
         regime_probs = torch.diagonal(rho_evolved, dim1=-2, dim2=-1)
 
         return regime_probs, rho_evolved
+
+
+class ClassicalRegimeDetector(nn.Module):
+    """Softmax regime head used as a control for QuantumRegimeDetector.
+
+    Same inputs and outputs as the quantum detector. ``hidden_dim=None`` gives
+    a linear softmax; an integer gives a one-hidden-layer ELU MLP, which with
+    hidden_dim=10 matches the quantum detector's parameter count (E=64, C=3,
+    K=4: 724 vs 696). The returned matrix is diag(p), a valid density matrix
+    whose von Neumann entropy equals the Shannon entropy of p. The repo's
+    entropy term H(p) - S(rho) is therefore identically zero for this head,
+    which matches the quantum head's minimum (a rho diagonal in the readout basis).
+
+    Args:
+        input_dim: Dimension of the pooled embedding.
+        context_dim: Dimension of the yield curve context vector.
+        num_regimes: Number of market regimes (K).
+        hidden_dim: Hidden width, or None for a linear map.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        context_dim: int = 3,
+        num_regimes: int = 4,
+        hidden_dim: int | None = None,
+    ) -> None:
+        super().__init__()
+        combined_dim = input_dim + context_dim
+        if hidden_dim is None:
+            self.logits = nn.Linear(combined_dim, num_regimes)
+        else:
+            self.logits = nn.Sequential(
+                nn.Linear(combined_dim, hidden_dim),
+                nn.ELU(),
+                nn.Linear(hidden_dim, num_regimes),
+            )
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        regime_probs = torch.softmax(self.logits(torch.cat([embeddings, context], dim=-1)), dim=-1)
+        return regime_probs, torch.diag_embed(regime_probs)
+
+
+def build_regime_detector(
+    kind: str,
+    input_dim: int,
+    context_dim: int,
+    num_regimes: int,
+) -> nn.Module:
+    """Returns the regime head named by ``kind``: quantum, softmax or softmax_mlp."""
+    if kind == "quantum":
+        return QuantumRegimeDetector(input_dim=input_dim, context_dim=context_dim, num_regimes=num_regimes)
+    if kind == "softmax":
+        return ClassicalRegimeDetector(input_dim, context_dim, num_regimes, hidden_dim=None)
+    if kind == "softmax_mlp":
+        return ClassicalRegimeDetector(input_dim, context_dim, num_regimes, hidden_dim=10)
+    raise ValueError(f"Unknown regime head {kind!r}.")

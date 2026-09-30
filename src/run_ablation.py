@@ -51,11 +51,13 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool
 
 from src.data_loader import (
     FinancialGraphDataset,
     WalkForwardSplitter,
+    dataset_view,
     build_synthetic_dataframe,
     get_device,
 )
@@ -66,7 +68,7 @@ from src.evaluation import (
 )
 from src.layers.geometric import GeometricEmbedding
 from src.layers.graph import GraphDependencyLayer
-from src.layers.quantum import QuantumRegimeDetector
+from src.layers.quantum import QuantumRegimeDetector, build_regime_detector
 from src.losses import GDLQuantumLoss
 from src.models import GDLQuantumFinanceModel
 from src.train import (
@@ -90,15 +92,19 @@ def _get_config_name(config_id: str) -> str:
         "A0": "Linear_Baseline",
         "A1": "Euclidean_MLP",
         "A2": "Geometry_Only",
-        "A3": "Geometry_Graph",
-        "A4": "Geometry_Quantum",
-        "A5": "Euclidean_Quantum_Graph",
-        "A6": "Graph_Only",
-        "A7": "Quantum_Only",
+        # Corrected 2026-09: earlier runs wrote A3-A7 files under swapped
+        # labels (A3 Geometry_Graph, A4 Geometry_Quantum, A5 Euclidean_Quantum_Graph,
+        # A6 Graph_Only, A7 Quantum_Only). The config_id prefix was always right.
+        "A3": "Graph_Only",
+        "A4": "Quantum_Only",
+        "A5": "Geometry_Graph",
+        "A6": "Geometry_Quantum",
+        "A7": "Graph_Quantum",
         "A8": "Full_Model",
         "A9": "LSTM_Baseline",
     }
-    return names.get(config_id, config_id)
+    base_id, _ = _resolve_variant(config_id)
+    return names.get(config_id, f"{names.get(base_id, base_id)}_{config_id}")
 
 
 # Ablation configuration names in order.
@@ -114,6 +120,45 @@ ABLATION_IDS: list[str] = [
     "A8",
     "A9",
 ]
+
+# Single-term controls: (base config, model flags, loss overrides). Each differs
+# from its base in exactly one named respect so the comparison is ceteris paribus.
+ABLATION_VARIANTS: dict[str, tuple[str, dict[str, Any], dict[str, float]]] = {
+    # Euclidean twins: same MLP, no sphere projection, no uniformity loss.
+    "A2e": ("A2", {"sphere": False}, {"uniformity": 0.0}),
+    # Sphere kept, pre-normalisation norm restored as one scalar input to the head.
+    "A2m": ("A2", {"magnitude": True}, {}),
+    # Sphere kept, uniformity loss removed (with A2e this separates projection from loss).
+    "A2u": ("A2", {}, {"uniformity": 0.0}),
+    "A6e": ("A6", {"sphere": False}, {"uniformity": 0.0}),
+    "A8e": ("A8", {"sphere": False}, {"uniformity": 0.0}),
+    # Sphere kept, uniformity loss removed.
+    "A6u": ("A6", {}, {"uniformity": 0.0}),
+    "A8u": ("A8", {}, {"uniformity": 0.0}),
+    # Classical regime heads replacing the density-matrix layer.
+    "A6c": ("A6", {"regime_head": "softmax_mlp"}, {}),
+    "A8c": ("A8", {"regime_head": "softmax_mlp"}, {}),
+    "A6s": ("A6", {"regime_head": "softmax"}, {}),
+    "A8s": ("A8", {"regime_head": "softmax"}, {}),
+    # LSTM baseline whose input window ends at r_t instead of r_{t-1}.
+    "A9t": ("A9", {}, {}),
+}
+
+# Dataset options that a variant changes (passed to FinancialGraphDataset).
+VARIANT_DATASET_KWARGS: dict[str, dict[str, Any]] = {
+    "A9t": {"sequence_includes_current": True},
+}
+# Default runs stay A0-A9; variants run only when named with --configs.
+ALL_IDS: list[str] = ABLATION_IDS + list(ABLATION_VARIANTS)
+
+
+def _resolve_variant(config_id: str) -> tuple[str, dict[str, Any]]:
+    """Maps a variant ID to (base ID, model flags); base IDs map to themselves."""
+    if config_id in ABLATION_VARIANTS:
+        base_id, flags, _ = ABLATION_VARIANTS[config_id]
+        return base_id, dict(flags)
+    return config_id, {}
+
 
 ABLATION_DESCRIPTIONS: dict[str, str] = {
     # Intent: Null Hypothesis (A0).
@@ -135,6 +180,18 @@ ABLATION_DESCRIPTIONS: dict[str, str] = {
     "A7": "Graph + Quantum (no geometric/manifold)",
     "A8": "Full Model (all components)",
     "A9": "LSTM Baseline (on raw return sequences)",
+    "A2e": "A2 without sphere projection or uniformity loss",
+    "A2m": "A2 with the discarded embedding norm fed to the head",
+    "A2u": "A2 without uniformity loss",
+    "A6e": "A6 without sphere projection or uniformity loss",
+    "A8e": "A8 without sphere projection or uniformity loss",
+    "A6u": "A6 without uniformity loss",
+    "A8u": "A8 without uniformity loss",
+    "A6c": "A6 with parameter-matched softmax-MLP regime head",
+    "A8c": "A8 with parameter-matched softmax-MLP regime head",
+    "A6s": "A6 with linear softmax regime head",
+    "A8s": "A8 with linear softmax regime head",
+    "A9t": "A9 with the input window including the current day's return",
 }
 
 
@@ -316,14 +373,19 @@ class GeometricOnlyModel(nn.Module):
         feature_dim: int,
         embedding_dim: int,
         prediction_hidden_dim: int = 16,
+        sphere: bool = True,
+        magnitude: bool = False,
     ) -> None:
         super().__init__()
         self.geometric = GeometricEmbedding(
             input_dim=feature_dim,
             output_dim=embedding_dim,
+            normalize=sphere,
         )
+        # Mechanism probe: hand the head the norm the sphere discards.
+        self.magnitude = magnitude
         self.head = nn.Sequential(
-            nn.Linear(embedding_dim, prediction_hidden_dim),
+            nn.Linear(embedding_dim + int(magnitude), prediction_hidden_dim),
             nn.ELU(),
             nn.Linear(prediction_hidden_dim, 1),
         )
@@ -350,7 +412,11 @@ class GeometricOnlyModel(nn.Module):
             Predictions and embeddings.
         """
         h = self.geometric(x)  # (total_nodes, E)
-        preds = self.head(h)  # (total_nodes, 1)
+        head_input = h
+        if self.magnitude:
+            pre_norm = self.geometric.projection(F.elu(self.geometric.pre_projection(x)))
+            head_input = torch.cat([h, torch.log1p(pre_norm.norm(dim=-1, keepdim=True))], dim=-1)
+        preds = self.head(head_input)  # (total_nodes, 1)
 
         return {
             "predictions": preds,
@@ -609,16 +675,17 @@ class GeometricQuantumModel(nn.Module):
         num_regimes: int = 4,
         context_dim: int = 3,
         prediction_hidden_dim: int = 16,
+        sphere: bool = True,
+        regime_head: str = "quantum",
     ) -> None:
         super().__init__()
         self.geometric = GeometricEmbedding(
             input_dim=feature_dim,
             output_dim=embedding_dim,
+            normalize=sphere,
         )
-        self.quantum = QuantumRegimeDetector(
-            input_dim=embedding_dim,
-            context_dim=context_dim,
-            num_regimes=num_regimes,
+        self.quantum = build_regime_detector(
+            regime_head, embedding_dim, context_dim, num_regimes
         )
         self.regime_gate = nn.Sequential(
             nn.Linear(num_regimes, embedding_dim),
@@ -902,6 +969,9 @@ def build_ablation_model(
     Raises:
         ValueError: If config_id is not a valid ablation identifier.
     """
+    variant_id = config_id
+    config_id, flags = _resolve_variant(config_id)
+
     geo = config["model"]["geometric"]
     qm = config["model"]["quantum"]
     gr = config["model"]["graph"]
@@ -943,6 +1013,7 @@ def build_ablation_model(
             feature_dim=feature_dim,
             embedding_dim=embedding_dim,
             prediction_hidden_dim=pred_hidden,
+            **flags,
         )
 
     elif config_id == "A3":
@@ -983,6 +1054,7 @@ def build_ablation_model(
             num_regimes=num_regimes,
             context_dim=context_dim,
             prediction_hidden_dim=pred_hidden,
+            **flags,
         )
 
     elif config_id == "A7":
@@ -1010,6 +1082,7 @@ def build_ablation_model(
             prediction_hidden_dim=pred_hidden,
             dropout=dropout,
             edge_drop=edge_drop,
+            **flags,
         )
 
     elif config_id == "A9":
@@ -1026,8 +1099,8 @@ def build_ablation_model(
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
         "Built %s (%s): %d trainable parameters on %s.",
-        config_id,
-        ABLATION_DESCRIPTIONS.get(config_id, ""),
+        variant_id,
+        ABLATION_DESCRIPTIONS.get(variant_id, ""),
         n_params,
         device,
     )
@@ -1055,6 +1128,10 @@ def _build_criterion_for_config(
     from src.train import _resolve_loss_weights
 
     weights, profile_name, _ = _resolve_loss_weights(config)
+    weights = dict(weights)
+    if config_id in ABLATION_VARIANTS:
+        weights.update(ABLATION_VARIANTS[config_id][2])
+    config_id, _ = _resolve_variant(config_id)
 
     # Read max points from config (same as main training loop)
     training_cfg = config.get("training", {})
@@ -1111,6 +1188,14 @@ def train_ablation_fold(
     parquet_path: Path | None = None,
     use_wandb: bool = False,
     experiment_id: str | None = None,
+    control: str | None = None,
+    dump_predictions: bool = False,
+    inner_val_days: int | None = None,
+    experiments_dir: Path | None = None,
+    stop_metric: str = "total",
+    crn: bool = False,
+    base_dataset: FinancialGraphDataset | None = None,
+    checkpoint_root: Path | None = None,
 ) -> dict[str, Any]:
     """Trains and evaluates a single ablation configuration on one fold.
 
@@ -1126,6 +1211,22 @@ def train_ablation_fold(
         parquet_path: Path to fact_table.parquet.
         use_wandb: Whether to log to Weights & Biases.
         experiment_id: Optional ID to group configurations in W&B.
+        control: Optional negative control (data_loader.NEGATIVE_CONTROLS).
+            'shuffle_labels' is applied to training data only, so evaluation
+            is always against true returns; graph controls apply to both.
+        dump_predictions: Save per-stock evaluation predictions to parquet.
+        inner_val_days: If set, early stopping uses the last N training dates
+            (after a purge gap) and the validation window is used only for the
+            reported evaluation. None keeps the original protocol, in which
+            the validation window serves both purposes.
+        stop_metric: 'total' (original: the full weighted loss, which includes
+            the uniformity/entropy terms only for some configs) or 'supervised'
+            (w_pred * MSE + w_dir * directional, identical for every config).
+        crn: Common random numbers: shuffle with a dedicated generator seeded by
+            ``seed`` so every config sees the same batch order.
+        base_dataset: Already loaded dataset over all dates; the fold's
+            datasets become views of it instead of fresh copies of the panel.
+        checkpoint_root: Checkpoint directory (default output/checkpoints/ablation).
 
     Returns:
         Dictionary with fold results including metrics.
@@ -1134,10 +1235,10 @@ def train_ablation_fold(
         w_cfg = config.get("wandb", {})
 
         # Determine local directory for W&B logs for this config
-        experiments_dir = _PROJECT_ROOT / config.get("evaluation", {}).get(
+        wandb_root = experiments_dir or _PROJECT_ROOT / config.get("evaluation", {}).get(
             "experiments_dir", "experiments"
         )
-        wandb_dir = experiments_dir / config_id / "wandb"
+        wandb_dir = wandb_root / config_id / "wandb"
         wandb_dir.mkdir(parents=True, exist_ok=True)
 
         wandb.init(
@@ -1148,7 +1249,7 @@ def train_ablation_fold(
             mode=w_cfg.get("mode", "online"),
             group=config_id,
             job_type="ablation",
-            name=f"{config_id}_fold_{fold_idx:02d}_seed_{seed}",
+            name=f"{config_id}_fold_{fold_idx:02d}_seed_{seed}{tag}",
             config={**config, "ablation_id": config_id, "seed": seed},
             reinit=True,
         )
@@ -1156,6 +1257,17 @@ def train_ablation_fold(
     # Set random seeds for reproducibility
     torch.manual_seed(seed)
     np.random.seed(seed)
+    base_id, _ = _resolve_variant(config_id)
+    if inner_val_days is not None and inner_val_days <= 0:
+        raise ValueError("inner_val_days must be a positive number of dates.")
+    # Controls and protocol options get their own tag so their files never
+    # overwrite the checkpoints and dumps of the original runs.
+    tag = (
+        (f"_{control}" if control else "")
+        + (f"_iv{inner_val_days}" if inner_val_days is not None else "")
+        + ("_sup" if stop_metric == "supervised" else "")
+        + ("_crn" if crn else "")
+    )
 
     t_cfg = config["training"]
     max_epochs: int = t_cfg["max_epochs"]
@@ -1191,8 +1303,32 @@ def train_ablation_fold(
     else:
         common_kwargs["parquet_path"] = _PROJECT_ROOT / config["data"]["parquet_path"]
 
-    train_ds = FinancialGraphDataset(dates=train_dates, **common_kwargs)
-    val_ds = FinancialGraphDataset(dates=val_dates, **common_kwargs)
+    if base_dataset is None:
+        base_dataset = FinancialGraphDataset(**common_kwargs)
+    variant_attrs = VARIANT_DATASET_KWARGS.get(config_id, {})
+    train_control = control
+    eval_control = None if control == "shuffle_labels" else control
+    stop_dates = val_dates
+    if inner_val_days is not None:
+        purge = int(config["training"]["walk_forward"].get("purge_gap", 20))
+        stop_dates = train_dates[-inner_val_days:]
+        train_dates = train_dates[: -(inner_val_days + purge)]
+        logger.info(
+            "%s | Fold %d: inner validation uses %d training dates for fitting and %d for early stopping.",
+            config_id,
+            fold_idx,
+            len(train_dates),
+            len(stop_dates),
+        )
+    train_ds = dataset_view(base_dataset, train_dates, train_control, seed, **variant_attrs)
+    val_ds = dataset_view(base_dataset, val_dates, eval_control, seed, **variant_attrs)
+    # Early stopping must see the same (possibly shuffled) labels as training,
+    # otherwise selection on true labels could leak signal into a null control.
+    stop_ds = (
+        val_ds
+        if inner_val_days is None and train_control == eval_control
+        else dataset_view(base_dataset, stop_dates, train_control, seed, **variant_attrs)
+    )
 
     if len(train_ds) == 0 or len(val_ds) == 0:
         logger.warning(
@@ -1234,22 +1370,24 @@ def train_ablation_fold(
 
     # Skip GPU correlation graph build for configs that do not use the graph.
     # Speeds up A0, A1, A2, A4, A6, A9 significantly.
-    use_graph = config_id in ("A3", "A5", "A7", "A8")
+    use_graph = base_id in ("A3", "A5", "A7", "A8")
+
+    shuffle_gen = torch.Generator().manual_seed(seed) if crn else None
 
     # Build DataLoaders once (workers persist across all epochs in this fold).
     # A9 processes ~20k ticker sequences per date, so a full batch of 64 dates
     # requires ~40 GiB of LSTM activation memory for gradient storage.
     # We override to a smaller batch size for A9 only; all other configs use
     # the value from config.yaml unchanged.
-    if config_id == "A9":
+    if base_id == "A9":
         lstm_batch = int(config.get("training", {}).get("lstm_batch_size", 8))
         loader_cfg = {**config, "training": {**config.get("training", {}), "batch_size": lstm_batch}}
         logger.info("A9: using lstm_batch_size=%d (main batch_size=%d).", lstm_batch, batch_size)
-        train_loader = _make_dataloader(train_ds, loader_cfg, shuffle=True)
-        val_loader = _make_dataloader(val_ds, loader_cfg, shuffle=False)
+        train_loader = _make_dataloader(train_ds, loader_cfg, shuffle=True, generator=shuffle_gen)
+        val_loader = _make_dataloader(stop_ds, loader_cfg, shuffle=False)
     else:
-        train_loader = _make_dataloader(train_ds, config, shuffle=True)
-        val_loader = _make_dataloader(val_ds, config, shuffle=False)
+        train_loader = _make_dataloader(train_ds, config, shuffle=True, generator=shuffle_gen)
+        val_loader = _make_dataloader(stop_ds, config, shuffle=False)
 
     best_model_state: dict | None = None
     fold_start = time.time()
@@ -1315,7 +1453,12 @@ def train_ablation_fold(
                 }
             )
 
-        if early_stop(val_metrics["total"], epoch):
+        stop_value = (
+            val_metrics["total"]
+            if stop_metric == "total"
+            else criterion.w_pred * val_metrics["prediction"] + criterion.w_dir * val_metrics["directional"]
+        )
+        if early_stop(stop_value, epoch):
             break
 
         if early_stop.best_epoch == epoch:
@@ -1336,24 +1479,26 @@ def train_ablation_fold(
 
     fold_time = time.time() - fold_start
 
-    # Checkpoint and PnL export paths (resolved once per fold)
+    # Checkpoint and PnL export paths (resolved once per fold). Controls and the
+    # inner-validation protocol get their own tag so they never overwrite the
+    # checkpoints of the original runs.
     safe_model_name = _get_config_name(config_id)
 
-    checkpoint_dir = _PROJECT_ROOT / "output" / "checkpoints" / "ablation" / config_id
+    checkpoint_dir = (checkpoint_root or _PROJECT_ROOT / "output" / "checkpoints" / "ablation") / config_id
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = (
         checkpoint_dir
-        / f"{config_id}_{safe_model_name}_fold_{fold_idx:02d}_seed_{seed}.pt"
+        / f"{config_id}_{safe_model_name}_fold_{fold_idx:02d}_seed_{seed}{tag}.pt"
     )
 
-    experiments_dir = _PROJECT_ROOT / config.get("evaluation", {}).get(
+    experiments_dir = experiments_dir or _PROJECT_ROOT / config.get("evaluation", {}).get(
         "experiments_dir", "experiments"
     )
     debug_dir = experiments_dir / config_id / "debug_pnl"
     debug_dir.mkdir(parents=True, exist_ok=True)
     dump_pnl_path = str(
         debug_dir
-        / f"pnl_{config_id}_{safe_model_name}_fold_{fold_idx:02d}_seed_{seed}.npy"
+        / f"pnl_{config_id}_{safe_model_name}_fold_{fold_idx:02d}_seed_{seed}{tag}.npy"
     )
 
     # Restore best weights and save the checkpoint
@@ -1374,6 +1519,12 @@ def train_ablation_fold(
         )
         logger.info("Saved ablation model checkpoint to %s", checkpoint_path)
 
+    dump_predictions_path = (
+        experiments_dir / "predictions" / f"pred_{config_id}_fold_{fold_idx:02d}_seed_{seed}{tag}.parquet"
+        if dump_predictions
+        else None
+    )
+
     # Evaluate
     eval_metrics = evaluate_model_on_dataset(
         model,
@@ -1381,6 +1532,7 @@ def train_ablation_fold(
         device,
         debug_pnl=True,
         dump_pnl_path=dump_pnl_path,
+        dump_predictions_path=dump_predictions_path,
     )
 
     logger.info(
@@ -1412,6 +1564,10 @@ def train_ablation_fold(
         "fold": fold_idx,
         "seed": seed,
         "skipped": False,
+        "control": control or "",
+        "inner_val_days": inner_val_days or 0,
+        "stop_metric": stop_metric,
+        "crn": crn,
         "best_epoch": early_stop.best_epoch + 1,
         "best_val_loss": early_stop.best_loss,
         "training_time_s": fold_time,
@@ -1427,6 +1583,13 @@ def run_ablation(
     device_override: str | None = None,
     use_wandb: bool = False,
     experiments_dir: Path | None = None,
+    seeds: list[int] | None = None,
+    control: str | None = None,
+    dump_predictions: bool = False,
+    inner_val_days: int | None = None,
+    stop_metric: str = "total",
+    crn: bool = False,
+    checkpoint_root: Path | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Runs the full ablation study across configurations and seeds.
 
@@ -1454,10 +1617,11 @@ def run_ablation(
     # Unique experiment ID for grouping ablation runs
     experiment_id = f"ablation_{int(time.time())}" if use_wandb else None
 
-    seeds: list[int] = config.get("evaluation", {}).get(
-        "ablation_seeds",
-        [42, 123, 456, 789, 1024],
-    )
+    if seeds is None:
+        seeds = config.get("evaluation", {}).get(
+            "ablation_seeds",
+            [42, 123, 456, 789, 1024],
+        )
 
     # Load or synthesise data once; reuse across all folds to avoid
     # repeatedly reading the 44M-row parquet file.
@@ -1496,6 +1660,7 @@ def run_ablation(
         train_window=wf_cfg["train_window"],
         validation_window=wf_cfg["validation_window"],
         step_size=wf_cfg["step_size"],
+        purge_gap=int(wf_cfg.get("purge_gap", 20)),
     )
 
     # Handle insufficient data (smoke test fallback)
@@ -1586,6 +1751,14 @@ def run_ablation(
                         parquet_path=parquet_path,
                         use_wandb=use_wandb,
                         experiment_id=experiment_id,
+                        control=control,
+                        dump_predictions=dump_predictions,
+                        inner_val_days=inner_val_days,
+                        experiments_dir=experiments_dir,
+                        stop_metric=stop_metric,
+                        crn=crn,
+                        base_dataset=full_ds,
+                        checkpoint_root=checkpoint_root,
                     )
                     all_results[cid].append(result)
         finally:
@@ -1622,6 +1795,10 @@ def save_raw_results(
                 "description": ABLATION_DESCRIPTIONS.get(cid, ""),
                 "fold": r["fold"],
                 "seed": r["seed"],
+                "control": r.get("control", ""),
+                "inner_val_days": r.get("inner_val_days", 0),
+                "stop_metric": r.get("stop_metric", "total"),
+                "crn": r.get("crn", False),
                 "best_epoch": r.get("best_epoch", ""),
                 "best_val_loss": r.get("best_val_loss", ""),
                 "training_time_s": r.get("training_time_s", ""),
@@ -1673,7 +1850,7 @@ def save_summary_table(
     csv_path = experiments_dir / "ablation_summary.csv"
 
     rows: list[dict[str, Any]] = []
-    for cid in ABLATION_IDS:
+    for cid in ALL_IDS:
         if cid not in all_results:
             continue
         results = [r for r in all_results[cid] if not r.get("skipped", False)]
@@ -1742,8 +1919,6 @@ def compute_significance(
         "directional_accuracy",
         "sharpe_daily",
         "sharpe_annual",
-        "mse",
-        "mae",
         "max_drawdown",
     ]
 
@@ -1761,7 +1936,7 @@ def compute_significance(
 
     rows: list[dict[str, Any]] = []
 
-    for cid in ABLATION_IDS:
+    for cid in ALL_IDS:
         if cid == "A8" or cid not in all_results:
             continue
         abl_results = [r for r in all_results[cid] if not r.get("skipped", False)]
@@ -1769,24 +1944,24 @@ def compute_significance(
             continue
 
         for metric in metrics:
-            a8_vals = [
-                r["metrics"][metric]
+            # Pair on (fold, seed) so skipped folds or extra seeds cannot
+            # misalign the two series.
+            a8_by_key = {
+                (r["fold"], r["seed"]): r["metrics"][metric]
                 for r in a8_results
                 if metric in r.get("metrics", {})
-            ]
-            abl_vals = [
-                r["metrics"][metric]
+            }
+            abl_by_key = {
+                (r["fold"], r["seed"]): r["metrics"][metric]
                 for r in abl_results
                 if metric in r.get("metrics", {})
-            ]
-
-            # Align lengths (take min of both)
-            n = min(len(a8_vals), len(abl_vals))
-            if n < 2:
+            }
+            keys = sorted(set(a8_by_key) & set(abl_by_key))
+            if len(keys) < 2:
                 continue
 
-            a8_arr = np.array(a8_vals[:n])
-            abl_arr = np.array(abl_vals[:n])
+            a8_arr = np.array([a8_by_key[k] for k in keys])
+            abl_arr = np.array([abl_by_key[k] for k in keys])
 
             t_result = paired_t_test(a8_arr, abl_arr)
             significant = t_result["p_value"] < alpha
@@ -1884,7 +2059,7 @@ def parse_args() -> argparse.Namespace:
         "--configs",
         nargs="+",
         default=None,
-        choices=ABLATION_IDS,
+        choices=ALL_IDS,
         help="Subset of ablation configs to run (default: all).",
     )
     parser.add_argument(
@@ -1907,6 +2082,57 @@ def parse_args() -> argparse.Namespace:
         help="Force a specific compute device.",
     )
     parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Override evaluation.ablation_seeds from config.",
+    )
+    parser.add_argument(
+        "--control",
+        choices=["shuffle_labels", "permute_graph_nodes", "stale_graph", "inject_target"],
+        default=None,
+        help="Run a negative control (see data_loader.NEGATIVE_CONTROLS).",
+    )
+    parser.add_argument(
+        "--dump-predictions",
+        action="store_true",
+        help="Save per-stock evaluation predictions for src/posthoc_eval.py.",
+    )
+    parser.add_argument(
+        "--inner-val-days",
+        type=int,
+        default=None,
+        help="Early-stop on the last N (purged) training dates instead of the "
+        "evaluation window. Default keeps the original protocol.",
+    )
+    parser.add_argument(
+        "--stop-metric",
+        choices=["total", "supervised"],
+        default="total",
+        help="Early-stopping criterion. 'supervised' uses the same prediction loss "
+        "for every config; 'total' (original) adds config-specific auxiliary terms.",
+    )
+    parser.add_argument(
+        "--crn",
+        action="store_true",
+        help="Common random numbers: identical batch order across configs for a seed.",
+    )
+    parser.add_argument(
+        "--experiments-dir",
+        type=Path,
+        default=None,
+        help="Output directory (default: evaluation.experiments_dir). Use one per "
+        "experiment so result tables are not overwritten by later runs.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Request deterministic kernels (warn-only: PyG scatter ops on CUDA "
+        "remain non-deterministic, so graph configs are reproducible only up "
+        "to floating-point summation order).",
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         help="Enable Weights & Biases logging.",
@@ -1927,12 +2153,17 @@ def main() -> None:
     config_path = Path(args.config) if args.config else None
     config = load_config(config_path)
 
+    if args.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.benchmark = False
+
     if args.max_epochs is not None:
         config["training"]["max_epochs"] = args.max_epochs
         logger.info("Overriding max_epochs to %d.", args.max_epochs)
 
     eval_cfg = config.get("evaluation", {})
-    experiments_dir = _PROJECT_ROOT / eval_cfg.get(
+    experiments_dir = args.experiments_dir or _PROJECT_ROOT / eval_cfg.get(
         "experiments_dir",
         "experiments",
     )
@@ -1977,6 +2208,13 @@ def main() -> None:
         device_override=args.device,
         use_wandb=use_wandb,
         experiments_dir=experiments_dir,
+        seeds=args.seeds,
+        control=args.control,
+        dump_predictions=args.dump_predictions,
+        inner_val_days=args.inner_val_days,
+        stop_metric=args.stop_metric,
+        crn=args.crn,
+        checkpoint_root=args.experiments_dir / "checkpoints" if args.experiments_dir else None,
     )
 
     if not all_results:
@@ -2018,9 +2256,10 @@ def main() -> None:
             means.get("max_drawdown", float("nan")),
         )
 
-    figures_dir = _PROJECT_ROOT / eval_cfg.get(
-        "figures_dir",
-        "experiments/figures",
+    figures_dir = (
+        args.experiments_dir / "figures"
+        if args.experiments_dir
+        else _PROJECT_ROOT / eval_cfg.get("figures_dir", "experiments/figures")
     )
 
     # Save outputs

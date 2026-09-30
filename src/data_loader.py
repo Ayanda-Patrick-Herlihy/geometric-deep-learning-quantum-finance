@@ -14,6 +14,7 @@ References:
         Nature Physics.
 """
 
+import copy
 import logging
 from pathlib import Path
 from typing import Iterator
@@ -66,6 +67,20 @@ DEFAULT_CONTEXT_COLUMNS: list[str] = [
 # Column used for rolling correlation and graph construction.
 RETURN_COLUMN: str = "log_return_1d"
 
+# Negative controls for FinancialGraphDataset(control=...). None = original data.
+#   shuffle_labels      : targets permuted across stocks within each date (IC -> 0 expected)
+#   permute_graph_nodes : correlation graph built from other stocks' histories
+#   stale_graph         : correlation graph from the preceding non-overlapping window
+#                         (ending rolling_window+1 days before t); empty graph if none exists
+#   inject_target       : POSITIVE control; first feature replaced by the target (IC -> ~1)
+NEGATIVE_CONTROLS: tuple[str | None, ...] = (
+    None,
+    "shuffle_labels",
+    "permute_graph_nodes",
+    "stale_graph",
+    "inject_target",
+)
+
 # MAD scaling constant: 1.4826 * MAD approximates standard deviation
 # for normally distributed data, making this robust to outliers.
 _MAD_SCALE: float = 1.4826
@@ -115,6 +130,12 @@ class FinancialGraphDataset(TorchDataset):
         dataframe: Pre-loaded DataFrame. If provided, parquet_path
             is ignored. Useful for testing without real data.
         sequence_length: Number of past return steps for LSTM baselines.
+        control: Optional negative control (see NEGATIVE_CONTROLS). None
+            reproduces the original pipeline exactly.
+        control_seed: Seed for the control's per-date randomisation.
+        sequence_includes_current: If True, the LSTM sequence ends at the
+            current date's return r_t (known at the close of t, like every
+            engineered feature). False keeps the original r_{t-T}..r_{t-1}.
     """
 
     valid_dates: list[pd.Timestamp]
@@ -129,12 +150,20 @@ class FinancialGraphDataset(TorchDataset):
         normalise: bool = True,
         dataframe: pd.DataFrame | None = None,
         sequence_length: int = 60,
+        control: str | None = None,
+        control_seed: int = 0,
+        sequence_includes_current: bool = False,
         **kwargs: object,
     ) -> None:
         super().__init__()
         self.parquet_path = Path(parquet_path)
         self.normalise = normalise
         self.sequence_length = sequence_length
+        if control not in NEGATIVE_CONTROLS:
+            raise ValueError(f"Unknown control {control!r}; expected one of {NEGATIVE_CONTROLS}.")
+        self.control = control
+        self.control_seed = control_seed
+        self.sequence_includes_current = sequence_includes_current
 
         # Resolve configuration
         if isinstance(config, dict):
@@ -296,6 +325,12 @@ class FinancialGraphDataset(TorchDataset):
             )
             g = equity_df.groupby("Ticker", observed=True)[RETURN_COLUMN]
             equity_df["target_fwd"] = g.shift(-1)
+
+        # Return realised one day later (t+1 -> t+2) for skip-day evaluation,
+        # which separates predictive signal from next-day bid-ask bounce.
+        equity_df["target_fwd_skip1"] = equity_df.groupby("Ticker", observed=True)[
+            "target_fwd"
+        ].shift(-1)
 
         # Date-grouped lookup for fast cross-section access
         self._date_groups: dict[pd.Timestamp, pd.DataFrame] = dict(
@@ -472,12 +507,17 @@ class FinancialGraphDataset(TorchDataset):
             dummy.x_seq = torch.zeros(1, self.sequence_length, 1, dtype=torch.float32)
             dummy.close_price = torch.zeros(1, dtype=torch.float32)
             dummy.volume = torch.zeros(1, dtype=torch.float32)
+            dummy.y_skip1 = torch.full((1,), float("nan"), dtype=torch.float32)
+            dummy.ticker_id = torch.full((1,), -1, dtype=torch.long)
             return dummy
 
         # Node features — replace NaN *and* inf (e.g. log(0) = -inf
         # from delisted stocks) so they do not poison normalisation.
         feats = cs[self.available_features].values.astype(np.float32)
         feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.control == "inject_target":
+            # Deliberate leak: shows the harness detects one when it exists.
+            feats[:, 0] = np.nan_to_num(cs["target_fwd"].values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         x = torch.tensor(feats, dtype=torch.float32)
 
         # Robust normalisation to handle fat-tailed financial distributions
@@ -489,6 +529,8 @@ class FinancialGraphDataset(TorchDataset):
 
         # Forward targets — mark inf as invalid (same as NaN)
         raw_targets = cs["target_fwd"].values.astype(np.float32)
+        raw_skip = cs["target_fwd_skip1"].values.astype(np.float32)
+        rng = np.random.default_rng([self.control_seed, self._date_to_idx[date]])
         mask = np.isfinite(raw_targets)
 
         # If is_tradable exists (from Stage 3 quality gating), further
@@ -498,8 +540,19 @@ class FinancialGraphDataset(TorchDataset):
             tradable = cs["is_tradable"].values.astype(bool)
             mask = mask & tradable
 
+        if self.control == "shuffle_labels":
+            # Permute targets among the supervised stocks of this date: breaks
+            # any feature-target link but keeps the universe and distribution.
+            idx = np.flatnonzero(mask)
+            perm = rng.permutation(idx)
+            raw_targets = raw_targets.copy()
+            raw_skip = raw_skip.copy()
+            raw_targets[idx] = raw_targets[perm]
+            raw_skip[idx] = raw_skip[perm]
+
         targets = np.nan_to_num(raw_targets, nan=0.0, posinf=0.0, neginf=0.0)
         y = torch.tensor(targets, dtype=torch.float32)
+        y_skip1 = torch.tensor(raw_skip, dtype=torch.float32)  # NaN kept: marks missing
         target_mask = torch.tensor(mask, dtype=torch.bool)
         close_prices = torch.tensor(
             np.nan_to_num(
@@ -532,9 +585,17 @@ class FinancialGraphDataset(TorchDataset):
         # Pad to fixed length (rolling_window) so PyG Batch collate can
         # concatenate along node dimension; variable T would break batching.
         date_idx = self._date_to_idx[date]
-        start = max(0, date_idx - self.rolling_window)
-        window_dates = self._all_dates[start : date_idx + 1]
-        window_df = self.return_pivot.loc[window_dates, tickers]
+        graph_idx = date_idx
+        if self.control == "stale_graph":
+            # Correlations from the window that ends just before today's window
+            # starts: same length and coverage, strictly past, no overlap.
+            graph_idx = date_idx - self.rolling_window - 1
+        if graph_idx < 0:
+            window_df = self.return_pivot.iloc[0:0][tickers]  # no stale history: empty graph
+        else:
+            start = max(0, graph_idx - self.rolling_window)
+            window_dates = self._all_dates[start : graph_idx + 1]
+            window_df = self.return_pivot.loc[window_dates, tickers]
         returns_arr = window_df.values  # (T_actual, N)
         past_returns = torch.tensor(returns_arr.T, dtype=torch.float32)
         past_returns = torch.nan_to_num(past_returns, nan=0.0, posinf=0.0, neginf=0.0)
@@ -546,6 +607,10 @@ class FinancialGraphDataset(TorchDataset):
             )
         elif T_actual > self.rolling_window:
             past_returns = past_returns[:, -self.rolling_window :]
+        if self.control == "permute_graph_nodes":
+            # Randomly reassign return histories to stocks: same degree and
+            # weight distribution, but neighbours are unrelated stocks.
+            past_returns = past_returns[torch.as_tensor(rng.permutation(n))]
 
         # Sequence data for LSTM baselines (N, T, 1)
         x_seq = self._get_sequence_data(date, tickers)
@@ -568,6 +633,13 @@ class FinancialGraphDataset(TorchDataset):
         data.past_returns = past_returns
         data.close_price = close_prices
         data.volume = volumes
+        data.y_skip1 = y_skip1
+        # Column position in return_pivot; lets evaluation track turnover and
+        # join predictions back to tickers. Not named *index* so PyG collation
+        # does not offset it.
+        data.ticker_id = torch.tensor(
+            self.return_pivot.columns.get_indexer(tickers), dtype=torch.long
+        )
 
         return data
 
@@ -593,10 +665,12 @@ class FinancialGraphDataset(TorchDataset):
             return torch.empty(len(tickers), 0, 1)
 
         date_idx = self._date_to_idx[date]
-        start_idx = max(0, date_idx - self.sequence_length)
+        end_idx = date_idx + 1 if self.sequence_includes_current else date_idx
+        start_idx = max(0, end_idx - self.sequence_length)
 
-        # Strictly historical: exclude date_idx so no overlap with forward target
-        window_df = self.return_pivot.iloc[start_idx:date_idx]
+        # The target is r_{t+1}, so r_t (row date_idx) is already disjoint from it;
+        # the original code excluded it, which hides any day-t signal from A9.
+        window_df = self.return_pivot.iloc[start_idx:end_idx]
         valid_cols = [t for t in tickers if t in self.return_pivot.columns]
         seq_data = window_df[valid_cols].values  # (T_actual, N_with_history)
 
@@ -633,6 +707,32 @@ class FinancialGraphDataset(TorchDataset):
     def num_context_features(self) -> int:
         """Dimension of the yield curve context vector."""
         return len(self.context_columns)
+
+
+def dataset_view(
+    base: "FinancialGraphDataset",
+    dates: list[pd.Timestamp] | None = None,
+    control: str | None = None,
+    control_seed: int = 0,
+    **attributes: object,
+) -> "FinancialGraphDataset":
+    """Date-restricted view of an already loaded dataset.
+
+    Equivalent to ``FinancialGraphDataset(dates=dates, control=..., ...)`` on
+    the same data and config (``dates`` only filters ``valid_dates``, and
+    controls act only in ``__getitem__``), but shares the loaded tables instead
+    of copying the full panel again.
+    """
+    if control not in NEGATIVE_CONTROLS:
+        raise ValueError(f"Unknown control {control!r}; expected one of {NEGATIVE_CONTROLS}.")
+    view = copy.copy(base)
+    if dates is not None:
+        view.valid_dates = sorted(set(dates) & set(base.valid_dates))
+    view.control = control
+    view.control_seed = control_seed
+    for name, value in attributes.items():
+        setattr(view, name, value)
+    return view
 
 
 class WalkForwardSplitter:
