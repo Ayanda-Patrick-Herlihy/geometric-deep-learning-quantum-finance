@@ -132,6 +132,13 @@ FEATURE_CONFIG = {
     "tradability_price_window": 22,           # rolling window for median price
     "tradability_dollar_vol_window": 22,      # rolling window for median dollar volume
     "tradability_zero_vol_window": 63,        # rolling window for zero-volume fraction
+    # Build the price and dollar-volume gates from point-in-time (as-traded)
+    # prices. EODHD's Close/Volume are back-adjusted for every later split and
+    # Adjusted_close also for later dividends, so gating on them uses future
+    # corporate actions. False reproduces the dissertation's fact table.
+    "tradability_point_in_time": True,
+    # Directory of per-ticker split histories from stage1_fetch_splits.py.
+    "splits_dir": None,
     # Foreign yield series for Group B/C 
     "foreign_yields": {
         "GER_10Y": {"ticker": "GER_10Y", "label": "DE"},
@@ -276,6 +283,78 @@ def winsorise_returns(
     return df
 
 
+def load_split_history(splits_dir: Path | None) -> pd.DataFrame:
+    """Loads per-ticker split histories written by stage1_fetch_splits.py.
+
+    Each ``<TICKER>.csv`` has columns ``date`` (first as-traded date after the
+    split) and ``split`` ("new/old", e.g. "4.000000/1.000000").
+
+    Returns:
+        DataFrame with columns Ticker, split_date and ratio (new/old shares).
+        Empty if the directory is missing.
+    """
+    if splits_dir is None or not Path(splits_dir).exists():
+        return pd.DataFrame(columns=["Ticker", "split_date", "ratio"])
+    frames = []
+    for path in sorted(Path(splits_dir).glob("*.csv")):
+        raw = pd.read_csv(path)
+        if raw.empty:
+            continue
+        parts = raw["split"].astype(str).str.split("/", expand=True).astype(float)
+        frames.append(
+            pd.DataFrame(
+                {
+                    "Ticker": path.stem,
+                    "split_date": pd.to_datetime(raw["date"]),
+                    "ratio": parts[0] / parts[1],
+                }
+            )
+        )
+    if not frames:
+        return pd.DataFrame(columns=["Ticker", "split_date", "ratio"])
+    splits = pd.concat(frames, ignore_index=True)
+    return splits[np.isfinite(splits["ratio"]) & (splits["ratio"] > 0)]
+
+
+def compute_point_in_time_prices(
+    df: pd.DataFrame,
+    ticker_col: str,
+    splits: pd.DataFrame,
+) -> pd.DataFrame:
+    """Adds as-traded close and volume by undoing later split adjustments.
+
+    EODHD's ``Close`` and ``Volume`` are adjusted for every split that happens
+    after the row's date. The as-traded values multiply (divide) them by the
+    product of the ratios of all splits dated after the row:
+    ``close_pit = Close * F(t)``, ``volume_pit = Volume / F(t)``. Dollar
+    volume ``Close * Volume`` is unaffected by splits.
+
+    Args:
+        df: DataFrame with Date, Close and Volume columns.
+        ticker_col: Column identifying each security.
+        splits: Output of ``load_split_history``.
+
+    Returns:
+        DataFrame with ``close_pit``, ``volume_pit`` and ``split_factor_after``.
+    """
+    df = df.copy()
+    factor = np.ones(len(df))
+    if not splits.empty:
+        dates = df["Date"].to_numpy()
+        tickers = df[ticker_col].astype(str).to_numpy()
+        for ticker, group in splits.groupby("Ticker"):
+            rows = np.flatnonzero(tickers == ticker)
+            if rows.size == 0:
+                continue
+            for split_date, ratio in zip(group["split_date"], group["ratio"]):
+                before = rows[dates[rows] < np.datetime64(split_date)]
+                factor[before] *= ratio
+    df["split_factor_after"] = factor
+    df["close_pit"] = df["Close"] * factor
+    df["volume_pit"] = df["Volume"] / factor
+    return df
+
+
 def compute_tradability_flags(
     df: pd.DataFrame,
     ticker_col: str,
@@ -290,8 +369,12 @@ def compute_tradability_flags(
     excluded from the supervised loss and any portfolio construction.
 
     Criteria (all must be True simultaneously for is_tradable=True):
-        1. Rolling median Adjusted_close >= tradability_min_price.
-        2. Rolling median dollar volume >= tradability_min_dollar_volume.
+        1. Rolling median price >= tradability_min_price. With
+           tradability_point_in_time the price is the as-traded close_pit;
+           otherwise (dissertation) the back-adjusted Adjusted_close.
+        2. Rolling median dollar volume >= tradability_min_dollar_volume,
+           from Close * Volume (split-invariant, no dividend adjustment) when
+           point-in-time, otherwise Adjusted_close * Volume.
         3. Rolling zero-volume fraction < tradability_max_zero_vol_frac.
         4. Adjusted_close is not NaN on this row.
 
@@ -321,13 +404,17 @@ def compute_tradability_flags(
     min_dv = config.get("tradability_min_dollar_volume", 50_000)
     max_zv = config.get("tradability_max_zero_vol_frac", 0.50)
 
+    point_in_time = config.get("tradability_point_in_time", False) and "close_pit" in df.columns
+    price_source = "close_pit" if point_in_time else "Adjusted_close"
+    dv_price_source = "Close" if point_in_time else "Adjusted_close"
+
     # Rolling median price
-    df["rolling_median_price"] = grouped["Adjusted_close"].transform(
+    df["rolling_median_price"] = grouped[price_source].transform(
         lambda s: s.rolling(window=price_window, min_periods=1).median()
     )
 
     # Rolling median dollar volume
-    df["_dollar_vol"] = df["Adjusted_close"].abs() * df["Volume"]
+    df["_dollar_vol"] = df[dv_price_source].abs() * df["Volume"]
     df["rolling_median_dollar_vol"] = grouped["_dollar_vol"].transform(
         lambda s: s.rolling(window=dv_window, min_periods=1).median()
     )
@@ -918,6 +1005,20 @@ def engineer_equity_features(equity_df: pd.DataFrame, config: dict) -> pd.DataFr
         spread_window=config["spread_window"],
     )
 
+    # As-traded prices for universe gating (no look-ahead through later splits)
+    if config.get("tradability_point_in_time", False) and "Close" in equity_df.columns:
+        splits = config.get("_split_history")
+        if splits is None:
+            splits = load_split_history(config.get("splits_dir"))
+        if splits.empty:
+            logger.warning(
+                "  No split history found (splits_dir=%s): close_pit equals the "
+                "split-adjusted Close, so the price gate still uses later splits. "
+                "Run stage1_fetch_splits.py first.",
+                config.get("splits_dir"),
+            )
+        equity_df = compute_point_in_time_prices(equity_df, "Ticker", splits)
+
     # Universe quality gating — flag tradable rows
     equity_df = compute_tradability_flags(
         equity_df, ticker_col="Ticker", config=config
@@ -1096,6 +1197,15 @@ def main(master_path: Path, output_path: Path, config: Optional[dict] = None) ->
     """Orchestrate the complete feature engineering pipeline."""
     if config is None:
         config = FEATURE_CONFIG
+    config = dict(config)
+    if config.get("tradability_point_in_time", False):
+        # Load split histories once, not once per ticker batch.
+        config["_split_history"] = load_split_history(config.get("splits_dir"))
+        logger.info(
+            "Point-in-time tradability: %d splits loaded from %s.",
+            len(config["_split_history"]),
+            config.get("splits_dir"),
+        )
 
 
     logger.info("STAGE 3: Feature Engineering")
@@ -1200,4 +1310,8 @@ if __name__ == "__main__":
     MASTER_FILE = PROJECT_ROOT / "data" / "interim" / "master_consolidated.csv"
     OUTPUT_FILE = PROJECT_ROOT / "data" / "interim" / "master_features.csv"
 
-    main(master_path=MASTER_FILE, output_path=OUTPUT_FILE)
+    main(
+        master_path=MASTER_FILE,
+        output_path=OUTPUT_FILE,
+        config={**FEATURE_CONFIG, "splits_dir": PROJECT_ROOT / "data" / "raw" / "splits"},
+    )

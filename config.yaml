@@ -138,10 +138,20 @@ training:
     train_window: 1260     # Approximately 5 years of trading days
     validation_window: 252 # Approximately 1 year
     step_size: 252         # Approximately 1 year advance per fold (Increased to reduce runtime)
+    purge_gap: 20          # Dates skipped between training end and validation start
+
+  # Paper protocol (defaults for run_ablation.py; --original-protocol restores the
+  # dissertation's protocol, and each value can be overridden on the command line).
+  protocol:
+    inner_val_days: 126          # Early stopping on the last 126 training dates (after a purge);
+                                 # the validation window is used only for reported metrics.
+    stop_metric: "supervised"    # Early-stop on w_pred*MSE + w_dir*directional for every config,
+                                 # not on config-specific auxiliary loss terms.
+    common_random_numbers: true  # Same batch order for every config under a given seed.
 
 # Evaluation settings
 evaluation:
-  ablation_seeds: [42] # Single seed for faster iteration
+  ablation_seeds: [0, 1, 2] # Paper protocol; the dissertation used [42]
   eval_min_price: 5.0
   eval_min_dollar_volume: 1000000
   top_k: 50

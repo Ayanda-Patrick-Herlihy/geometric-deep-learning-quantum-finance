@@ -554,9 +554,14 @@ class FinancialGraphDataset(TorchDataset):
         y = torch.tensor(targets, dtype=torch.float32)
         y_skip1 = torch.tensor(raw_skip, dtype=torch.float32)  # NaN kept: marks missing
         target_mask = torch.tensor(mask, dtype=torch.bool)
+        # Evaluation universe filter uses as-traded prices when the fact table
+        # has them (stage 3 point-in-time columns); Close/Volume are
+        # back-adjusted for later splits. Dollar volume is the same either way.
+        price_col = "close_pit" if "close_pit" in cs.columns else "Close"
+        volume_col = "volume_pit" if "volume_pit" in cs.columns else "Volume"
         close_prices = torch.tensor(
             np.nan_to_num(
-                cs["Close"].values.astype(np.float32),
+                cs[price_col].values.astype(np.float32),
                 nan=0.0,
                 posinf=0.0,
                 neginf=0.0,
@@ -565,7 +570,7 @@ class FinancialGraphDataset(TorchDataset):
         )
         volumes = torch.tensor(
             np.nan_to_num(
-                cs["Volume"].values.astype(np.float32),
+                cs[volume_col].values.astype(np.float32),
                 nan=0.0,
                 posinf=0.0,
                 neginf=0.0,

@@ -2035,6 +2035,30 @@ def _configure_logging() -> None:
     )
 
 
+def _resolve_protocol(
+    args: argparse.Namespace, config: dict
+) -> tuple[int | None, str, bool, list[int] | None]:
+    """Protocol settings: CLI flags, else training.protocol, else the dissertation's.
+
+    Returns:
+        (inner_val_days, stop_metric, crn, seeds). seeds is None when the
+        config's evaluation.ablation_seeds should be used.
+    """
+    if args.original_protocol:
+        return None, "total", False, args.seeds or [42]
+    protocol = config.get("training", {}).get("protocol", {})
+    inner_val_days = args.inner_val_days if args.inner_val_days is not None else protocol.get("inner_val_days")
+    stop_metric = args.stop_metric or protocol.get("stop_metric", "total")
+    crn = args.crn if args.crn is not None else bool(protocol.get("common_random_numbers", False))
+    logger.info(
+        "Protocol: inner_val_days=%s, stop_metric=%s, common_random_numbers=%s.",
+        inner_val_days,
+        stop_metric,
+        crn,
+    )
+    return inner_val_days, stop_metric, crn, args.seeds
+
+
 def parse_args() -> argparse.Namespace:
     """Parses command-line arguments.
 
@@ -2089,6 +2113,12 @@ def parse_args() -> argparse.Namespace:
         help="Override evaluation.ablation_seeds from config.",
     )
     parser.add_argument(
+        "--original-protocol",
+        action="store_true",
+        help="Reproduce the dissertation protocol: early stopping on the validation "
+        "window with the total loss, no common random numbers, seed 42.",
+    )
+    parser.add_argument(
         "--control",
         choices=["shuffle_labels", "permute_graph_nodes", "stale_graph", "inject_target"],
         default=None,
@@ -2104,19 +2134,22 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Early-stop on the last N (purged) training dates instead of the "
-        "evaluation window. Default keeps the original protocol.",
+        "evaluation window (default: training.protocol.inner_val_days).",
     )
     parser.add_argument(
         "--stop-metric",
         choices=["total", "supervised"],
-        default="total",
-        help="Early-stopping criterion. 'supervised' uses the same prediction loss "
-        "for every config; 'total' (original) adds config-specific auxiliary terms.",
+        default=None,
+        help="Early-stopping criterion (default: training.protocol.stop_metric). "
+        "'supervised' uses the same prediction loss for every config; 'total' "
+        "(dissertation) adds config-specific auxiliary terms.",
     )
     parser.add_argument(
         "--crn",
-        action="store_true",
-        help="Common random numbers: identical batch order across configs for a seed.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Common random numbers: identical batch order across configs for a seed "
+        "(default: training.protocol.common_random_numbers).",
     )
     parser.add_argument(
         "--experiments-dir",
@@ -2161,6 +2194,8 @@ def main() -> None:
     if args.max_epochs is not None:
         config["training"]["max_epochs"] = args.max_epochs
         logger.info("Overriding max_epochs to %d.", args.max_epochs)
+
+    inner_val_days, stop_metric, crn, seeds = _resolve_protocol(args, config)
 
     eval_cfg = config.get("evaluation", {})
     experiments_dir = args.experiments_dir or _PROJECT_ROOT / eval_cfg.get(
@@ -2208,12 +2243,12 @@ def main() -> None:
         device_override=args.device,
         use_wandb=use_wandb,
         experiments_dir=experiments_dir,
-        seeds=args.seeds,
+        seeds=seeds,
         control=args.control,
         dump_predictions=args.dump_predictions,
-        inner_val_days=args.inner_val_days,
-        stop_metric=args.stop_metric,
-        crn=args.crn,
+        inner_val_days=inner_val_days,
+        stop_metric=stop_metric,
+        crn=crn,
         checkpoint_root=args.experiments_dir / "checkpoints" if args.experiments_dir else None,
     )
 
