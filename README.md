@@ -46,8 +46,10 @@ uv run python src/data_pipeline/stage4_export_parquet.py
 ## Training And Evaluation
 
 Random seeds for ablation runs are read from `config.yaml` under
-`evaluation.ablation_seeds`. The CLI does **not** accept a `--seeds`
-argument.
+`evaluation.ablation_seeds`, or given with `--seeds`. The training protocol
+(inner-validation early stopping, stopping metric, common random numbers) is
+read from `training.protocol`; `--original-protocol` reproduces the
+dissertation's single-seed protocol.
 
 ### Full ablation study (all configurations)
 

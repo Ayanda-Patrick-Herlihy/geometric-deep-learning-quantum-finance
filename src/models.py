@@ -21,7 +21,7 @@ from torch_geometric.nn import global_mean_pool
 
 from src.layers.geometric import GeometricEmbedding
 from src.layers.graph import GraphDependencyLayer
-from src.layers.quantum import QuantumRegimeDetector
+from src.layers.quantum import build_regime_detector
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,9 @@ class GDLQuantumFinanceModel(nn.Module):
         prediction_hidden_dim: Hidden dim for the prediction MLP.
         dropout: Feature dropout rate.
         edge_drop: DropEdge probability.
+        sphere: If False, use the Euclidean twin of the geometric layer (control).
+        regime_head: 'quantum' (default), or a classical control 'softmax' /
+            'softmax_mlp' (see layers.quantum.build_regime_detector).
     """
 
     def __init__(
@@ -63,12 +66,14 @@ class GDLQuantumFinanceModel(nn.Module):
         prediction_hidden_dim: int = 16,
         dropout: float = 0.1,
         edge_drop: float = 0.1,
+        sphere: bool = True,
+        regime_head: str = "quantum",
     ) -> None:
         super().__init__()
 
         # Stage 1: Project features onto the hypersphere
         self.geometric = GeometricEmbedding(
-            input_dim=feature_dim, output_dim=embedding_dim
+            input_dim=feature_dim, output_dim=embedding_dim, normalize=sphere
         )
 
         # Stage 2: Learn cross-asset dependencies from correlations
@@ -82,10 +87,8 @@ class GDLQuantumFinanceModel(nn.Module):
         )
 
         # Stage 3: Detect market regimes from pooled embeddings
-        self.quantum = QuantumRegimeDetector(
-            input_dim=embedding_dim,
-            context_dim=context_dim,
-            num_regimes=num_regimes,
+        self.quantum = build_regime_detector(
+            regime_head, embedding_dim, context_dim, num_regimes
         )
 
         # Stage 4: Gate graph output by regime probabilities
